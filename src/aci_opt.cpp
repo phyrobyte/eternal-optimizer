@@ -442,7 +442,7 @@ const Memory::Entry* Memory::find(const std::string& name) const {
 
 std::string Memory::save() const {
     std::string out = "studies " + std::to_string(studies) + "\n";
-    char buf[64];
+    char buf[80];   // three %.17g values are at most 24 characters each
     for (const auto& e : entries) {
         std::snprintf(buf, sizeof buf, "\t%.17g\t%.17g\t%.17g\n", e.cause_votes, e.seen, e.best_u);
         out += e.name + buf;

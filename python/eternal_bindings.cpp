@@ -25,6 +25,8 @@ static const char* kind_name(aci::Kind k) {
 static std::vector<aci::Param> to_params(const std::vector<std::tuple<std::string, double, double>>& ps) {
     std::vector<aci::Param> out;
     for (const auto& [name, lo, hi] : ps) {
+        if (name.empty() || name.find_first_of("\t\n") != std::string::npos)
+            throw py::value_error("parameter names must be non-empty and contain no tabs or newlines");
         if (!(lo < hi)) throw py::value_error("parameter '" + name + "': lower bound must be below upper bound");
         out.push_back({name, lo, hi});
     }

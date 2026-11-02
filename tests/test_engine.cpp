@@ -77,6 +77,19 @@ int main() {
         CHECK(median(ga) < median(gr), msg);
     }
 
+    {   // memory survives save/load even when every value needs all 17 significant digits
+        aci::Memory m;
+        m.studies = 3;
+        m.entries = {{"a", 3.4999999999999996e-05, 7.1234567890123456e-05, 1.2345678901234567e-05},
+                     {"b", -1.2345678901234567e-300, 2.5, 0.5}};
+        const aci::Memory r = aci::Memory::load(m.save());
+        bool same = r.studies == 3 && r.entries.size() == 2;
+        for (size_t i = 0; same && i < 2; ++i)
+            same = r.entries[i].name == m.entries[i].name && r.entries[i].cause_votes == m.entries[i].cause_votes &&
+                   r.entries[i].seen == m.entries[i].seen && r.entries[i].best_u == m.entries[i].best_u;
+        CHECK(same, "memory round-trips through save/load at full precision");
+    }
+
     std::printf(failures ? "\n%d FAILED\n" : "\nall passed\n", failures);
     return failures ? 1 : 0;
 }

@@ -66,7 +66,7 @@ def test_memory_roundtrip_and_warm_start():
     mem2 = eternal.Memory.load(mem.save())
     assert mem2.save() == mem.save()
     opt = eternal.Optimizer(BOUNDS, seed=5, memory=mem2)
-    assert opt._core.has_memory
+    assert opt.has_memory
     for _ in range(60):
         opt.tell(branin_with_decoys(**opt.ask()))
 
@@ -78,10 +78,19 @@ def test_bad_bounds():
         eternal.Optimizer([("x", 0, 1), ("x", 0, 2)])
     with pytest.raises(ValueError):
         eternal.Optimizer({})
+    for bad_name in ("", "a\tb", "a\nb"):
+        with pytest.raises(ValueError):
+            eternal.Optimizer({bad_name: (0, 1)})
 
 
-def test_nan_rejected():
-    opt = eternal.Optimizer(BOUNDS)
-    opt.ask()
-    with pytest.raises(ValueError):
-        opt.tell(float("nan"))
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_rejected(bad):
+    for opt in (eternal.Optimizer(BOUNDS), eternal.RandomSearch(BOUNDS)):
+        opt.ask()
+        with pytest.raises(ValueError):
+            opt.tell(bad)
+
+
+def test_best_is_inf_before_first_tell():
+    assert eternal.Optimizer(BOUNDS).best == math.inf
+    assert eternal.RandomSearch(BOUNDS).best == math.inf

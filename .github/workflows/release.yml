@@ -13,15 +13,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: pypa/cibuildwheel@v2.22.0
+      - uses: actions/checkout@v7
+      - uses: pypa/cibuildwheel@v4.3.5
         env:
-          CIBW_SKIP: "pp* *-musllinux_i686 *-win32 *-manylinux_i686"
+          CIBW_ARCHS: auto64
           CIBW_TEST_EXTRAS: test
           CIBW_TEST_COMMAND: pytest -q {project}/python/tests
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
@@ -29,9 +29,9 @@ jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: pipx run build --sdist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -44,7 +44,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

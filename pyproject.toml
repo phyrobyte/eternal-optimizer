@@ -9,7 +9,7 @@ description = "A causal black-box optimizer: intervenes before it models, and te
 readme = "README.en.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "phyrobyte" }]
 keywords = ["optimization", "black-box", "hyperparameter", "causal", "bayesian-optimization", "ask-tell", "mcp"]
 classifiers = [
