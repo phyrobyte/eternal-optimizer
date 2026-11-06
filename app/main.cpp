@@ -159,20 +159,95 @@ static const ImVec4 kKindColor[] = {
 
 // ------------------------------------------------------------------ fonts
 
-static std::string find_font(const char* suffix) {
+struct FontFile {
+    std::string path;
+    int index = 0;   // face inside a .ttc collection
+    bool empty() const { return path.empty(); }
+};
+
+// Hiragino on macOS: "ヒラギノ角ゴシック W3.ttc" and friends, skipping the Chinese "GB" cut.
+static FontFile find_hiragino(const char* suffix, std::vector<std::string>& tried) {
     for (const char* dir : {"/System/Library/Fonts", "/Library/Fonts"}) {
+        tried.push_back(std::string(dir) + "/*" + suffix);
         std::error_code ec;
         for (const auto& e : fs::directory_iterator(dir, ec)) {
             const std::string n = e.path().filename().string();
             if (n.size() >= std::strlen(suffix) && n.compare(n.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0 &&
                 n.find("GB") == std::string::npos)
-                return e.path().string();
+                return {e.path().string()};
         }
     }
-    for (const char* p : {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "C:/Windows/Fonts/meiryo.ttc",
-                          "/System/Library/Fonts/Hiragino Sans GB.ttc"})
-        if (fs::exists(p)) return p;
     return {};
+}
+
+static FontFile first_existing(const std::vector<std::string>& paths, std::vector<std::string>& tried) {
+    for (const auto& p : paths) {
+        tried.push_back(p);
+        std::error_code ec;
+        if (fs::exists(p, ec)) return {p};   // Noto CJK collections list the JP face first
+    }
+    return {};
+}
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+// Ask fontconfig for any installed font that covers Japanese; prefers a JP sans face of the wanted weight.
+static FontFile fontconfig_ja(bool bold, std::vector<std::string>& tried) {
+    tried.push_back(bold ? "fc-list :lang=ja (bold)" : "fc-list :lang=ja (regular)");
+    // %{weight} is fontconfig's numeric weight: 75 book, 80 regular, 100 medium, 200 bold.
+    FILE* f = popen("fc-list -f '%{file}|%{index}|%{weight}|%{family}\\n' ':lang=ja' 2>/dev/null", "r");
+    if (!f) return {};
+    FontFile best;
+    int best_score = -1000;
+    char line[1024];
+    while (std::fgets(line, sizeof line, f)) {
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        const size_t a = s.find('|'), b = a == std::string::npos ? a : s.find('|', a + 1),
+                     c = b == std::string::npos ? b : s.find('|', b + 1);
+        if (c == std::string::npos) continue;
+        const std::string file = s.substr(0, a), family = s.substr(c + 1);
+        const int weight = std::atoi(s.substr(b + 1, c - b - 1).c_str());   // "[0 210]" (variable) reads as 0
+        if (file.find("VF") != std::string::npos) continue;   // variable fonts: stb_truetype can't read CFF2
+        const std::string ext = file.size() >= 4 ? file.substr(file.size() - 4) : "";
+        if (ext != ".ttc" && ext != ".ttf" && ext != ".otf" && ext != ".otc") continue;
+        if (bold ? weight < 180 : (weight < 50 || weight > 100)) continue;
+        int score = -std::abs(weight - (bold ? 200 : 80)) / 10;
+        if (family.find("JP") != std::string::npos || family.find("Japanese") != std::string::npos) score += 4;
+        if (family.find("Sans") != std::string::npos || family.find("Gothic") != std::string::npos) score += 2;
+        if (family.find("Mono") != std::string::npos) score -= 1;
+        if (score > best_score) { best_score = score; best = {file, std::atoi(s.substr(a + 1, b - a - 1).c_str())}; }
+    }
+    pclose(f);
+    return best;
+}
+#endif
+
+// A Japanese-capable font in the wanted weight, from the usual per-platform locations.
+static FontFile find_cjk_font(bool bold, std::vector<std::string>& tried) {
+    FontFile f = find_hiragino(bold ? "W6.ttc" : "W3.ttc", tried);
+    if (!f.empty()) return f;
+    const char* w = bold ? "Bold" : "Regular";
+    std::vector<std::string> paths;
+    for (const char* dir : {"/usr/share/fonts/opentype/noto",                // Debian, Ubuntu
+                            "/usr/share/fonts/noto-cjk",                     // Arch, Gentoo
+                            "/usr/share/fonts/google-noto-sans-cjk-fonts",   // Fedora
+                            "/usr/share/google-noto-sans-cjk-fonts",         // older Fedora
+                            "/usr/share/fonts/truetype/noto",
+                            "/usr/local/share/fonts"})
+        paths.push_back(std::string(dir) + "/NotoSansCJK-" + w + ".ttc");
+#ifdef _WIN32
+    const char* windir = std::getenv("WINDIR");
+    const std::string fonts = std::string(windir ? windir : "C:/Windows") + "/Fonts/";
+    paths.push_back(fonts + (bold ? "YuGothB.ttc" : "YuGothR.ttc"));
+    paths.push_back(fonts + (bold ? "meiryob.ttc" : "meiryo.ttc"));
+#endif
+    f = first_existing(paths, tried);
+    if (!f.empty()) return f;
+#if !defined(_WIN32) && !defined(__APPLE__)
+    f = fontconfig_ja(bold, tried);
+    if (!f.empty()) return f;
+#endif
+    return first_existing({"/System/Library/Fonts/Hiragino Sans GB.ttc"}, tried);
 }
 
 static void load_fonts(float scale, const std::vector<aci::Problem>& probs, ImFont** big) {
@@ -189,12 +264,26 @@ static void load_fonts(float scale, const std::vector<aci::Problem>& probs, ImFo
     static ImVector<ImWchar> ranges;
     b.BuildRanges(&ranges);
 
-    const std::string regular = find_font("W3.ttc"), bold = find_font("W6.ttc");
+    std::vector<std::string> tried;
+    const FontFile regular = find_cjk_font(false, tried);
+    FontFile bold = find_cjk_font(true, tried);
+    if (bold.empty()) bold = regular;   // headings at least keep their size and glyphs
     ImFontConfig cfg;
     cfg.OversampleH = 2;
-    if (!regular.empty()) io.Fonts->AddFontFromFileTTF(regular.c_str(), 16.0f * scale, &cfg, ranges.Data);
-    else io.Fonts->AddFontDefault();
-    *big = !bold.empty() ? io.Fonts->AddFontFromFileTTF(bold.c_str(), 26.0f * scale, &cfg, ranges.Data) : nullptr;
+    if (!regular.empty()) {
+        cfg.FontNo = regular.index;
+        io.Fonts->AddFontFromFileTTF(regular.path.c_str(), 16.0f * scale, &cfg, ranges.Data);
+    } else {
+        io.Fonts->AddFontDefault();
+        if (!g_en) {
+            g_en = true;   // the default font has no Japanese glyphs; English stays readable
+            std::fprintf(stderr, "eternal: no Japanese font found, starting in English. Looked in:\n");
+            for (const auto& t : tried) std::fprintf(stderr, "  %s\n", t.c_str());
+            std::fprintf(stderr, "Install Noto Sans CJK (e.g. fonts-noto-cjk / google-noto-sans-cjk-fonts / noto-fonts-cjk).\n");
+        }
+    }
+    cfg.FontNo = bold.index;
+    *big = !bold.empty() ? io.Fonts->AddFontFromFileTTF(bold.path.c_str(), 26.0f * scale, &cfg, ranges.Data) : nullptr;
     io.FontGlobalScale = 1.0f / scale;
 }
 
@@ -1088,6 +1177,7 @@ int main(int argc, char** argv) {
     Session s;
     ImFont* big = nullptr;
     load_fonts(std::max(1.0f, sx), s.probs, &big);
+    glfwSetWindowTitle(win, tr(ja::kTitle));   // load_fonts may have switched to English
     style();
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 150");
