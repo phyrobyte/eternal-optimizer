@@ -91,6 +91,9 @@ struct Options {
     double recall_spread = 0.08;  // their spread, as a share of each range
     double recall_zoom = 0.2;     // starting search range: remembered best +- this share of the range
     int recall_confirm = 1;       // confirming interventions per remembered knob (a fresh knob gets 3)
+    // group screening: above this many knobs, test them in random groups first and only split
+    // the groups that move the result, so the screening cost grows with sqrt(d), not d
+    int group_min = 32;
 };
 
 class Optimizer {
@@ -124,11 +127,14 @@ public:
     Kind pending_kind() const { return pending_.kind; }
 
 private:
-    struct Plan { std::vector<double> x; Kind kind; int param; };
+    struct Plan { std::vector<double> x; Kind kind; int param; int group = -1; };
 
     std::vector<double> uniform_point(std::mt19937_64& g) const;
-    void plan_screening(const std::vector<int>& which, bool full = false);
+    void plan_screening(const std::vector<int>& which, bool full = false, bool individual = false);
     void finish_screening();
+    void plan_group_screening(const std::vector<int>& which);
+    void queue_group_round(int remeasures);
+    void finish_group_round();
     Plan propose();
     Plan propose_local();
     void counts(int p, std::vector<double>& s, std::vector<double>& f) const;
@@ -165,6 +171,14 @@ private:
     double sigma_ = 0.0;
     int last_recheck_ = 0;
     std::vector<Verdict> verdict_;
+    // group screening
+    bool grouping_ = false;
+    int group_round_ = 0;
+    std::vector<std::vector<int>> groups_;
+    std::vector<std::vector<double>> group_ys_;
+    std::vector<int> group_singles_;
+    int screen_cost_start_ = -1;   // first trial of the current grouped screening, -1 if none
+    int last_screen_cost_ = 0;     // trials the last grouped screening took (spaces out rechecks)
 
     // the rule region (trust region) per parameter
     std::vector<double> lo_, hi_;
