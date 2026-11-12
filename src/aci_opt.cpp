@@ -28,7 +28,11 @@ Optimizer::Optimizer(std::vector<Param> params, uint64_t seed, Options opt, cons
             }
         if (known == 0) prior_.clear();
     }
-    if (opt_.warmup <= 0) opt_.warmup = has_memory() ? std::max(4, d_ / 2) : std::max(10, 2 * d_);
+    if (opt_.warmup <= 0) {
+        if (has_memory()) opt_.warmup = std::max(4, d_ / 2);
+        else if (d_ > opt_.group_min) opt_.warmup = std::max(2 * opt_.group_min, static_cast<int>(4 * std::sqrt(double(d_))));
+        else opt_.warmup = std::max(10, 2 * d_);
+    }
     if (has_memory()) local_step_ = 0.05;
     verdict_.assign(d_, Verdict{});
     for (const auto& p : params_) { lo_.push_back(p.lo); hi_.push_back(p.hi); }
@@ -77,7 +81,7 @@ std::vector<double> Optimizer::ask() {
     } else {
         std::vector<int> frozen;
         for (int i = 0; i < d_; ++i) if (!verdict_[i].cause) frozen.push_back(i);
-        if (!frozen.empty() && T - last_recheck_ >= opt_.recheck_every) {
+        if (!frozen.empty() && T - last_recheck_ >= std::max(opt_.recheck_every, 3 * last_screen_cost_)) {
             plan_screening(frozen);
             pending_ = queue_.front();
             queue_.erase(queue_.begin());
@@ -108,10 +112,11 @@ void Optimizer::tell(double y) {
         scale_ = std::max(1e-12, std::sqrt(s / trials_.size()));
     }
     if (pending_.kind == Kind::Remeasure) base_ys_.push_back(y);
+    if (pending_.group >= 0) group_ys_[pending_.group].push_back(y);
     if (pending_.kind == Kind::Local) {
         local_step_ = clampd(y < before ? local_step_ * 1.5 : local_step_ * 0.93, 1e-5, 0.3);
     }
-    if (screening_ && queue_.empty()) finish_screening();
+    if (screening_ && queue_.empty()) grouping_ ? finish_group_round() : finish_screening();
     drives(before, best_y_);
     if (screened_) {
         maybe_zoom();
@@ -127,7 +132,11 @@ void Optimizer::tell(double y) {
 
 // ------------------------------------------------------------------ 1-2. intervene, necessity
 
-void Optimizer::plan_screening(const std::vector<int>& which, bool full) {
+void Optimizer::plan_screening(const std::vector<int>& which, bool full, bool individual) {
+    if (!individual && !full && !has_memory() && static_cast<int>(which.size()) > opt_.group_min) {
+        plan_group_screening(which);
+        return;
+    }
     screening_ = true;
     screen_params_ = which;
     screen_start_ = static_cast<int>(trials_.size());
@@ -183,10 +192,12 @@ void Optimizer::finish_screening() {
     const bool confirming = confirming_;
     confirming_ = false;
     std::vector<int> borderline;
+    std::vector<double> effects(d_, 0.0);
+    for (int t = screen_start_; t < T; ++t)
+        if (trials_[t].kind == Kind::Intervene && trials_[t].param >= 0)
+            effects[trials_[t].param] = std::max(effects[trials_[t].param], std::abs(trials_[t].y - m));
     for (int p : screen_params_) {
-        double effect = 0;
-        for (int t = screen_start_; t < T; ++t)
-            if (trials_[t].kind == Kind::Intervene && trials_[t].param == p) effect = std::max(effect, std::abs(trials_[t].y - m));
+        const double effect = effects[p];
         Verdict& v = verdict_[p];
         // in a confirmation round a clear echo is enough: noise rarely fakes an effect twice
         const bool was = v.cause, cause = effect > (confirming ? 0.6 : 1.0) * bar;
@@ -228,6 +239,141 @@ void Optimizer::finish_screening() {
         regions_from_memory_ = true;
         events_.push_back({static_cast<int>(trials_.size()) - 1, "recall", -1});
     }
+    if (screen_cost_start_ >= 0) {
+        last_screen_cost_ = T - screen_cost_start_;
+        screen_cost_start_ = -1;
+    }
+    screened_ = true;
+}
+
+// Group screening. Knobs are tested in random groups (every member moved at once); a group that
+// leaves the result unchanged clears all its members in three trials. A group that moves it is
+// halved until each real cause stands alone, and those go to the ordinary per-knob test above,
+// which keeps its doubt/confirm logic. Most knobs in a large study do nothing, so this costs
+// roughly 3 d / g + causes * 6 log2(g) instead of 3 d.
+void Optimizer::plan_group_screening(const std::vector<int>& which) {
+    screening_ = true;
+    grouping_ = true;
+    group_round_ = 0;
+    screen_params_ = which;
+    screen_start_ = static_cast<int>(trials_.size());
+    if (screen_cost_start_ < 0) screen_cost_start_ = screen_start_;
+    screen_base_x_ = best_x_;
+    base_ys_ = {best_y_};
+    group_singles_.clear();
+    std::vector<int> order = which;
+    std::shuffle(order.begin(), order.end(), rng_);
+    const int n = static_cast<int>(order.size());
+    const int g = std::clamp(static_cast<int>(std::lround(std::sqrt(double(n)))), 4, 64);
+    groups_.clear();
+    for (int i = 0; i < n; i += g) groups_.emplace_back(order.begin() + i, order.begin() + std::min(n, i + g));
+    queue_group_round(5);
+    last_recheck_ = static_cast<int>(trials_.size());
+}
+
+void Optimizer::queue_group_round(int remeasures) {
+    for (int r = 0; r < remeasures; ++r) queue_.push_back({screen_base_x_, Kind::Remeasure, -1});
+    group_ys_.assign(groups_.size(), {});
+    std::bernoulli_distribution coin(0.5);
+    for (int k = 0; k < static_cast<int>(groups_.size()); ++k) {
+        // probe 0 moves each member a quarter range with a random sign, probe 1 is its mirror image
+        // (so a knob sitting where one direction lands at the same height still shows up, and two
+        // causes that cancel in one direction add up in the other), probe 2 is random
+        std::vector<double> sign(groups_[k].size());
+        for (auto& s : sign) s = coin(rng_) ? 1.0 : -1.0;
+        for (int probe = 0; probe < 3; ++probe) {
+            auto x = screen_base_x_;
+            for (size_t j = 0; j < groups_[k].size(); ++j) {
+                const int p = groups_[k][j];
+                const double span = params_[p].hi - params_[p].lo;
+                double v;
+                if (probe < 2) {
+                    // clamp rather than reflect at a bound, so the two probes stay on opposite sides
+                    v = x[p] + (probe == 0 ? 0.25 : -0.25) * sign[j] * span;
+                } else {
+                    v = std::uniform_real_distribution<double>(params_[p].lo, params_[p].hi)(rng_);
+                }
+                x[p] = clampd(v, params_[p].lo, params_[p].hi);
+            }
+            queue_.push_back({x, Kind::Intervene, groups_[k].size() == 1 ? groups_[k][0] : -1, k});
+        }
+    }
+}
+
+void Optimizer::finish_group_round() {
+    double m = 0;
+    for (double v : base_ys_) m += v;
+    m /= base_ys_.size();
+    // noise from earlier batches plus this one, without committing this one yet
+    double ss = 0;
+    for (double v : sigma_samples_) ss += v * v;
+    for (double v : base_ys_) ss += (v - m) * (v - m);
+    const double dof = std::max(1.0, double(sigma_samples_.size() + base_ys_.size()) - (sigma_batches_ + 1));
+    const double floor = 1e-9 * (std::abs(m) + scale_) + 1e-15;
+    const double sig = std::max(std::sqrt(ss / dof), floor);
+    // a missed cause is costly and a false alarm only costs a split, so groups get a lower bar
+    const double bar = 0.7 * opt_.k_sigma * (1.0 + 2.0 / dof) * sig;
+    const int T = static_cast<int>(trials_.size());
+
+    std::vector<double> eff(groups_.size(), 0.0);
+    int fired = 0;
+    for (size_t k = 0; k < groups_.size(); ++k) {
+        for (double y : group_ys_[k]) eff[k] = std::max(eff[k], std::abs(y - m));
+        fired += eff[k] > bar;
+    }
+    // most groups firing on the first round means most knobs matter: splitting would only add cost
+    const bool dense = group_round_ == 0 && fired * 2 > static_cast<int>(groups_.size());
+    std::vector<std::vector<int>> next;
+    for (size_t k = 0; k < groups_.size(); ++k) {
+        const auto& G = groups_[k];
+        if (eff[k] > bar) {
+            if (G.size() == 1 || dense) {
+                group_singles_.insert(group_singles_.end(), G.begin(), G.end());
+            } else {
+                const size_t h = G.size() / 2;
+                next.emplace_back(G.begin(), G.begin() + h);
+                next.emplace_back(G.begin() + h, G.end());
+            }
+            continue;
+        }
+        for (int p : G) {                       // the whole group is inert: freeze its members
+            Verdict& v = verdict_[p];
+            v.tested = true;
+            v.effect = eff[k];
+            v.snr = eff[k] / sig;
+            v.checks += 1;
+            if (v.cause) {
+                v.cause = false;
+                lo_[p] = hi_[p] = screen_base_x_[p];
+                events_.push_back({T - 1, "freeze", p});
+            }
+        }
+    }
+    ++group_round_;
+    if (!next.empty()) {
+        groups_ = std::move(next);
+        queue_group_round(1);
+        return;
+    }
+    grouping_ = false;
+    groups_.clear();
+    group_ys_.clear();
+    for (double v : base_ys_) sigma_samples_.push_back(v - m);
+    ++sigma_batches_;
+    {
+        double s2 = 0;
+        for (double v : sigma_samples_) s2 += v * v;
+        sigma_ = std::sqrt(s2 / std::max(1.0, double(sigma_samples_.size()) - sigma_batches_));
+    }
+    if (!group_singles_.empty()) {
+        const std::vector<int> singles = std::move(group_singles_);
+        group_singles_.clear();
+        plan_screening(singles, false, true);   // keeps last_recheck_ fresh too
+        return;
+    }
+    screening_ = false;
+    last_screen_cost_ = T - screen_cost_start_;
+    screen_cost_start_ = -1;
     screened_ = true;
 }
 
