@@ -8,6 +8,7 @@
 //   eternal_transfer run <family> <shops> <budget> <memory 0|1> <noise_frac> <seed>
 //        Eternal over the shops in order, with or without memory carried between them.
 //        JSON: per shop, the gap curve and whether the screening matched the truth.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
